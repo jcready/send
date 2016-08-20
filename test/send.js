@@ -629,7 +629,7 @@ describe('send(file).pipe(res)', function () {
               body += chunk
             })
           })
-          .expect(206, done)
+          .expect(500, done)
         })
 
         it('should handle response ending before streaming finished', function (done) {

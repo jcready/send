@@ -808,6 +808,7 @@ SendStream.prototype.stream = function stream (path, options) {
  */
 
 SendStream.prototype.streamMultipart = function streamMultipart (path, options) {
+  var through = require('through')
   var finished = false
   var self = this
   var res = this.res
@@ -823,14 +824,8 @@ SendStream.prototype.streamMultipart = function streamMultipart (path, options) 
     // iterate through all the ranges
     asyncSeries(options.ranges, function (range, idx, next) {
       if (finished) return next()
+      var addHeaders = true
       var isLast = idx >= options.ranges.length - 1
-      var partHeaders = (
-        (idx ? CRLF : '') +
-        '--' + BOUNDARY + CRLF +
-        'Content-Type: ' + options.contentType + CRLF +
-        'Content-Range: ' + contentRange('bytes', fileSize, range) + CRLF +
-        CRLF
-      )
       /* istanbul ignore next */
       range.fd = isLegacyNodeVersion && idx ? null : fd
       range.autoClose = isLast
@@ -838,8 +833,18 @@ SendStream.prototype.streamMultipart = function streamMultipart (path, options) 
       stream.on('error', next)
       stream.on('end', function onpartend () { process.nextTick(next) })
       if (!idx) self.emit('stream', stream)
-      res.write(partHeaders)
-      stream.pipe(res, { end: false })
+      stream.pipe(through(function withHeaders (data) {
+        if (addHeaders) {
+          this.emit('data', new Buffer(
+            (idx ? CRLF : '') +
+            '--' + BOUNDARY + CRLF +
+            'Content-Type: ' + options.contentType + CRLF +
+            'Content-Range: ' + contentRange('bytes', fileSize, range) + CRLF +
+            CRLF
+          ))
+        }
+        this.emit('data', data)
+      })).pipe(res, { end: false })
     }, function sentparts (err) {
       if (finished) return
       if (err) {
