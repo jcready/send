@@ -9,7 +9,14 @@ describe('Attempting to close a bad file descriptor', function () {
       fd: fd,
       end: 0
     }).on('end', function () {
-      fs.close(fd)
+      fs.close(fd, function (e) {
+        if (e) {
+          console.log(e)
+          assert.equal(e.code, 'EBADF', 'has the correct error code')
+          assert.equal(e.errno, 9, 'has the correct error number')
+          done()
+        }
+      })
     }).on('error', function (e) {
       console.log(e)
       assert.equal(e.code, 'EBADF', 'has the correct error code')
