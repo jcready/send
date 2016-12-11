@@ -30,6 +30,7 @@ var path = require('path')
 var statuses = require('statuses')
 var Stream = require('stream')
 var util = require('util')
+var Readable = require('readable-stream')
 
 /**
  * Path function references.
@@ -42,6 +43,12 @@ var join = path.join
 var normalize = path.normalize
 var resolve = path.resolve
 var sep = path.sep
+
+/**
+ * No-op function
+ * @private
+ */
+var noop = Function.prototype
 
 /**
  * Regular expression for identifying a bytes Range header.
@@ -76,29 +83,18 @@ var UP_PATH_REGEXP = /(?:^|[\\\/])\.\.(?:[\\\/]|$)/
  * @public
  */
 
-module.exports = send
+module.exports = SendStream
 module.exports.mime = mime
 
 /**
- * Shim EventEmitter.listenerCount for node.js < 0.10
+ * Shim EventEmitter.prototype.listenerCount for node.js < 3.2.0
  */
 
-/* istanbul ignore next */
-var listenerCount = EventEmitter.listenerCount ||
-  function (emitter, type) { return emitter.listeners(type).length }
-
-/**
- * Return a `SendStream` for `req` and `path`.
- *
- * @param {object} req
- * @param {string} path
- * @param {object} [options]
- * @return {SendStream}
- * @public
- */
-
-function send (req, path, options) {
-  return new SendStream(req, path, options)
+/* istanbul ignore next: node.js < 3.2.0 does not have a native listenerCount */
+if (!EventEmitter.prototype.listenerCount) {
+  EventEmitter.prototype.listenerCount = function (type) {
+    return this.listeners(type).length
+  }
 }
 
 /**
@@ -107,10 +103,11 @@ function send (req, path, options) {
  * @param {Request} req
  * @param {String} path
  * @param {object} [options]
- * @private
+ * @public
  */
 
 function SendStream (req, path, options) {
+  if (!(this instanceof SendStream)) return new SendStream(req, path, options)
   Stream.call(this)
 
   var opts = options || {}
@@ -279,7 +276,7 @@ SendStream.prototype.maxage = deprecate.function(function maxage (maxAge) {
 
 SendStream.prototype.error = function error (status, error) {
   // emit if listeners instead of responding
-  if (listenerCount(this, 'error') !== 0) {
+  if (this.listenerCount('error') !== 0) {
     return this.emit('error', createError(error, status, {
       expose: false
     }))
@@ -326,8 +323,7 @@ SendStream.prototype.hasTrailingSlash = function hasTrailingSlash () {
  */
 
 SendStream.prototype.isConditionalGET = function isConditionalGET () {
-  return this.req.headers['if-none-match'] ||
-    this.req.headers['if-modified-since']
+  return this.req.headers['if-none-match'] || this.req.headers['if-modified-since']
 }
 
 /**
@@ -337,8 +333,6 @@ SendStream.prototype.isConditionalGET = function isConditionalGET () {
  */
 
 SendStream.prototype.removeContentHeaderFields = function removeContentHeaderFields () {
-  // istanbul ignore if
-  if (!this.res._headers) return
   var res = this.res
   var headers = Object.keys(res._headers)
 
@@ -402,11 +396,9 @@ SendStream.prototype.onStatError = function onStatError (error) {
     case 'ENAMETOOLONG':
     case 'ENOENT':
     case 'ENOTDIR':
-      this.error(404, error)
-      break
+      return this.error(404, error)
     default:
-      this.error(500, error)
-      break
+      return this.error(500, error)
   }
 }
 
@@ -431,9 +423,7 @@ SendStream.prototype.isFresh = function isFresh () {
 SendStream.prototype.isRangeFresh = function isRangeFresh () {
   var ifRange = this.req.headers['if-range']
 
-  if (!ifRange) {
-    return true
-  }
+  if (!ifRange) return true
 
   return ~ifRange.indexOf('"')
     ? ~ifRange.indexOf(this.res._headers['etag'])
@@ -448,15 +438,8 @@ SendStream.prototype.isRangeFresh = function isRangeFresh () {
  */
 
 SendStream.prototype.redirect = function redirect (path) {
-  if (listenerCount(this, 'directory') !== 0) {
-    this.emit('directory')
-    return
-  }
-
-  if (this.hasTrailingSlash()) {
-    this.error(403)
-    return
-  }
+  if (this.listenerCount('directory')) return this.emit('directory')
+  if (this.hasTrailingSlash()) return this.error(403)
 
   var loc = encodeUrl(collapseLeadingSlashes(path + '/'))
   var msg = 'Redirecting to <a href="' + escapeHtml(loc) + '">' + escapeHtml(loc) + '</a>\n'
@@ -482,6 +465,7 @@ SendStream.prototype.redirect = function redirect (path) {
 SendStream.prototype.pipe = function pipe (res) {
   // root path
   var root = this._root
+  var self = this
 
   // references
   this.res = res
@@ -554,13 +538,16 @@ SendStream.prototype.pipe = function pipe (res) {
     }
   }
 
-  // index file support
-  if (this._index.length && this.path[this.path.length - 1] === '/') {
-    this.sendIndex(path)
-    return res
-  }
+  onFinished(res, function () {
+    return typeof self.fd === 'number' && fs.close(self.fd, function () {
+      debug('closed the fd "%d"', self.fd)
+      self.fd = null
+    })
+  })
 
-  this.sendFile(path)
+  // index file support
+  if (this._index.length && this.path[this.path.length - 1] === '/') this.sendIndex(path)
+  else this.sendFile(path)
   return res
 }
 
@@ -575,6 +562,7 @@ SendStream.prototype.send = function send (path, stat) {
   var len = stat.size
   var options = this.options
   var opts = {}
+  var fd = this.fd
   var res = this.res
   var req = this.req
   var ranges = req.headers.range
@@ -582,11 +570,10 @@ SendStream.prototype.send = function send (path, stat) {
 
   if (res._header) {
     // impossible to send now
-    this.headersAlreadySent()
-    return
+    return this.headersAlreadySent()
   }
 
-  debug('pipe "%s"', path)
+  debug('pipe "%s" with fd "%d"', path, fd)
 
   // set header fields
   this.setHeader(path, stat)
@@ -596,8 +583,7 @@ SendStream.prototype.send = function send (path, stat) {
 
   // conditional GET support
   if (this.isConditionalGET() && this.isCachable() && this.isFresh()) {
-    this.notModified()
-    return
+    return this.notModified()
   }
 
   // adjust len to start/end options
@@ -610,9 +596,7 @@ SendStream.prototype.send = function send (path, stat) {
   // Range support
   if (this._acceptRanges && BYTES_RANGE_REGEXP.test(ranges)) {
     // parse
-    ranges = parseRange(len, ranges, {
-      combine: true
-    })
+    ranges = parseRange(len, ranges, { combine: true })
 
     // If-Range support
     if (!this.isRangeFresh()) {
@@ -623,14 +607,13 @@ SendStream.prototype.send = function send (path, stat) {
     // unsatisfiable
     if (ranges === -1) {
       debug('range unsatisfiable')
+      var resRange = contentRange('bytes', len)
 
       // Content-Range
-      res.setHeader('Content-Range', contentRange('bytes', len))
+      res.setHeader('Content-Range', resRange)
 
       // 416 Requested Range Not Satisfiable
-      return this.error(416, {
-        headers: {'Content-Range': res.getHeader('Content-Range')}
-      })
+      return this.error(416, { headers: { 'Content-Range': resRange } })
     }
 
     // valid (syntactically invalid treated as a regular response)
@@ -647,33 +630,30 @@ SendStream.prototype.send = function send (path, stat) {
         len = ranges[0].end - ranges[0].start + 1
       } else {
         opts = this.setMultipartHeader(path, stat, ranges)
+        opts.fd = fd
         // HEAD support
         return req.method === 'HEAD'
           ? res.end()
-          : this.streamMultipart(path, opts)
+          : this.stream(path, opts)
       }
     }
   }
 
   // clone options
-  for (var prop in options) {
-    opts[prop] = options[prop]
-  }
+  for (var prop in options) opts[prop] = options[prop]
 
   // set read options
   opts.start = offset
   opts.end = Math.max(offset, offset + len - 1)
+  opts.fd = fd
 
   // content-length
   res.setHeader('Content-Length', len)
 
   // HEAD support
-  if (req.method === 'HEAD') {
-    res.end()
-    return
-  }
-
-  this.stream(path, opts)
+  return req.method === 'HEAD'
+    ? res.end()
+    : this.stream(path, opts)
 }
 
 /**
@@ -685,32 +665,34 @@ SendStream.prototype.send = function send (path, stat) {
  * @api private
  */
 SendStream.prototype.setMultipartHeader = function setMultipartHeader (path, stat, ranges) {
-  var opts = {}
   var res = this.res
   var contentType = res.getHeader('Content-Type')
   var boundary = 'BYTERANGE_' + Date.now().toString(36).toUpperCase()
-  var partHeaders = opts.partHeaders = new Array(ranges.length)
-  opts.footer = CRLF + '--' + boundary + '--'
-  opts.ranges = ranges
+  var opts = {
+    ranges: ranges,
+    footer: CRLF + '--' + boundary + '--',
+    partHeaders: new Array(ranges.length),
+    highWaterMark: this.options.highWaterMark || 64 * 1024
+  }
 
   // calculate content length
   var len = opts.footer.length
   for (var i = ranges.length - 1; i >= 0; i--) {
-    partHeaders[i] = (
+    opts.partHeaders[i] = (
       (i ? CRLF : '') +
       '--' + boundary + CRLF +
       'Content-Type: ' + contentType + CRLF +
       'Content-Range: ' + contentRange('bytes', stat.size, ranges[i]) + CRLF +
       CRLF
     )
-    len += partHeaders[i].length
+    len += opts.partHeaders[i].length
     len += ranges[i].end - ranges[i].start + 1
   }
 
   // set multipart headers
   res.setHeader('Content-Disposition', 'attachment; filename="' + basename(path) + '"')
-  res.setHeader('Content-Length', len)
   res.setHeader('Content-Type', 'multipart/byteranges; boundary=' + boundary)
+  res.setHeader('Content-Length', len)
   return opts
 }
 
@@ -724,16 +706,13 @@ SendStream.prototype.sendFile = function sendFile (path) {
   var i = 0
   var self = this
 
-  debug('stat "%s"', path)
-  fs.stat(path, function onstat (err, stat) {
-    if (err && err.code === 'ENOENT' && !extname(path) && path[path.length - 1] !== sep) {
-      // not found, check extensions
-      return next(err)
-    }
-    if (err) return self.onStatError(err)
-    if (stat.isDirectory()) return self.redirect(self.path)
-    self.emit('file', path, stat)
-    self.send(path, stat)
+  debug('open "%s"', path)
+  fs.open(path, 'r', function onopen (err, fd) {
+    return !err
+      ? statThenSend(path, fd, self.onStatError.bind(self), self.redirect.bind(self, self.path))
+      : err.code === 'ENOENT' && !extname(path) && path[path.length - 1] !== sep
+        ? next(err) // not found, check extensions
+        : self.onStatError(err)
   })
 
   function next (err) {
@@ -742,15 +721,24 @@ SendStream.prototype.sendFile = function sendFile (path) {
         ? self.onStatError(err)
         : self.error(404)
     }
-
     var p = path + '.' + self._extensions[i++]
-
-    debug('stat "%s"', p)
-    fs.stat(p, function (err, stat) {
+    debug('open "%s"', p)
+    fs.open(p, 'r', function (err, fd) {
       if (err) return next(err)
-      if (stat.isDirectory()) return next()
-      self.emit('file', p, stat)
-      self.send(p, stat)
+      statThenSend(p, fd, next, next)
+    })
+  }
+
+  function statThenSend (path, fd, onError, onDirectory) {
+    debug('stat "%s"', path)
+    fs.fstat(fd, function onstat (err, stat) {
+      if (err || stat.isDirectory()) return fs.close(fd, function (e) {
+        if (e) debug('unable to close fd "%d" for path "%s"', fd, path)
+        return err ? onError(err) : onDirectory()
+      })
+      self.fd = fd
+      self.emit('file', path, stat)
+      return self.send(path, stat)
     })
   }
 }
@@ -765,7 +753,7 @@ SendStream.prototype.sendIndex = function sendIndex (path) {
   var i = -1
   var self = this
 
-  function next (err) {
+  return (function next (err) {
     if (++i >= self._index.length) {
       if (err) return self.onStatError(err)
       return self.error(404)
@@ -773,16 +761,20 @@ SendStream.prototype.sendIndex = function sendIndex (path) {
 
     var p = join(path, self._index[i])
 
-    debug('stat "%s"', p)
-    fs.stat(p, function (err, stat) {
+    fs.open(p, 'r', function onopen (err, fd) {
       if (err) return next(err)
-      if (stat.isDirectory()) return next()
-      self.emit('file', p, stat)
-      self.send(p, stat)
+      debug('stat "%s"', p)
+      fs.fstat(fd, function (err, stat) {
+        if (err || stat.isDirectory()) return fs.close(fd, function (e) {
+          if (e) debug('unable to close fd "%d"', fd)
+          next(err)
+        })
+        self.fd = fd
+        self.emit('file', p, stat)
+        self.send(p, stat)
+      })
     })
-  }
-
-  next()
+  })()
 }
 
 /**
@@ -798,19 +790,36 @@ SendStream.prototype.stream = function stream (path, options) {
   var finished = false
   var self = this
   var res = this.res
+  var stream = options.ranges
+    ? new MulitpartStream(path, options)
+    : fs.createReadStream(path, options)
 
-  // pipe
-  var stream = fs.createReadStream(path, options)
+  debug('got stream')
+
+  function cleanup () {
+    finished = true
+    destroy(stream)
+  }
+
+  function open (fd) {
+    self.emit('open', fd)
+    if (!finished) stream.pipe(res) // pipe
+  }
+
   this.emit('stream', stream)
-  stream.once('open', function () {
-    stream.pipe(res)
+  var emitOpen = typeof this.fd === 'number'
+    ? process.nextTick(open, this.fd)
+    : stream.on('open', open)
+
+  // request aborted
+  this.req.on('aborted', function onaborted () {
+    debug('request aborted')
+    cleanup()
+    res.end()
   })
 
   // response finished
-  onFinished(res, function onfinished () {
-    finished = true
-    destroy(stream)
-  })
+  onFinished(res, cleanup)
 
   // error handling code-smell
   stream.on('error', function onerror (err) {
@@ -818,72 +827,24 @@ SendStream.prototype.stream = function stream (path, options) {
     if (finished) return
 
     // clean up stream
-    finished = true
-    destroy(stream)
+    cleanup()
 
     // error
     self.onStatError(err)
+  })
+
+  stream.on('part', function onpart (part) {
+    self.emit('part', part)
   })
 
   // end
   stream.on('end', function onend () {
     self.emit('end')
   })
-}
 
-/**
- * Multipart Stream `path` to the response.
- *
- * @param {String} path
- * @param {Object} options
- * @api private
- */
-
-SendStream.prototype.streamMultipart = function streamMultipart (path, options) {
-  var self = this
-  var res = this.res
-  var ranges = options.ranges
-  var headers = options.partHeaders
-  var stream, finished
-
-  function finish () {
-    finished = true
-    destroy(stream)
-  }
-
-  fs.open(path, 'r', function beginMultipartStream (err, fd) {
-    if (err) return self.onStatError(err)
-    // iterate through all the ranges
-    asyncSeries(ranges, function streamPart (range, idx, next) {
-      if (finished) return next()
-      var isLast = idx >= ranges.length - 1
-      range.fd = fd
-      range.autoClose = isLast
-      stream = fs.createReadStream(path, range)
-      stream.on('error', next)
-      stream.on('end', function () {
-        if (!isLast) stream.fd = null // prevent node.js < 0.10 from closing the fd
-        process.nextTick(next)
-      })
-      if (!idx) self.emit('stream', stream)
-      res.write(headers[idx])
-      stream.pipe(res, { end: false })
-    }, function sentparts (err) {
-      if (finished) return
-      if (err) {
-        finish()
-        // istanbul ignore if
-        if (!stream.destroyed) fs.close(fd) // node.js < 0.10 doesn't close the fd on error
-        self.onStatError(err)
-      } else {
-        res.end(options.footer, function onend () {
-          self.emit('end')
-        })
-      }
-    })
-
-    // response finished
-    onFinished(res, finish)
+  // close
+  stream.on('close', function onclose () {
+    self.emit('close')
   })
 }
 
@@ -896,21 +857,16 @@ SendStream.prototype.streamMultipart = function streamMultipart (path, options) 
  */
 
 SendStream.prototype.type = function type (path) {
-  var res = this.res
-
-  if (res.getHeader('Content-Type')) return
+  if (this.res.getHeader('Content-Type')) return
 
   var type = mime.lookup(path)
 
-  if (!type) {
-    debug('no content-type')
-    return
-  }
+  if (!type) return debug('no content-type')
 
   var charset = mime.charsets.lookup(type)
 
   debug('content-type %s', type)
-  res.setHeader('Content-Type', type + (charset ? '; charset=' + charset : ''))
+  this.res.setHeader('Content-Type', type + (charset ? '; charset=' + charset : ''))
 }
 
 /**
@@ -949,6 +905,77 @@ SendStream.prototype.setHeader = function setHeader (path, stat) {
     debug('etag %s', val)
     res.setHeader('ETag', val)
   }
+}
+
+util.inherits(MulitpartStream, Readable)
+
+function MulitpartStream (path, opts) {
+  var part
+  var self = this
+  var fd = opts.fd
+  var ranges = opts.ranges
+  var hwm = opts.highWaterMark
+  var headers = opts.partHeaders
+  Readable.call(this, opts)
+  if (typeof opts.fd === 'number') return beginMultipartStream(self.fd = fd)
+  fs.open(path, 'r', function (err, fd) {
+    if (err) return self.emit('error', err)
+    self.emit('open', (self.fd = fd))
+    return beginMultipartStream(fd)
+  })
+
+  function beginMultipartStream (fd) {
+    asyncSeries(ranges, function streamPart (range, idx, next) {
+      if (self._finished) return next()
+      var isLast = idx >= ranges.length - 1
+      range.fd = fd
+      range.autoClose = isLast
+      range.highWaterMark = hwm
+      self.part = part = fs.createReadStream(path, range)
+      part.bufferSize = hwm
+      self.emit('part', part)
+      part.on('error', next)
+      part.on('end', function () {
+        if (!isLast) part.fd = null // prevent node.js < 0.10 from closing the fd
+        next()
+      })
+      part.once('data', function () {
+        self.push(headers[idx])
+      })
+      part.on('data', function (data) {
+        // istanbul ignore if: response buffer would need to be filled above high water mark
+        if (!self.push(data)) part.pause()
+      })
+      part.on('close', function () {
+        self.emit('close')
+      })
+    }, function sentParts (err) {
+      if (self._finished) return
+      if (err) {
+        self._finished = true
+        // istanbul ignore next: node.js < 0.10 doesn't close the fd on error
+        if (!part.destroyed) {
+          fs.close(fd, function (e) {
+            if (e) self.emit('error', e)
+            else self.emit('close')
+          })
+        }
+        self.emit('error', err)
+      } else {
+        self.push(opts.footer)
+        self.push(null)
+      }
+    })
+  }
+}
+
+MulitpartStream.prototype.destroy = function MultipartStream_destroy (cb) {
+  this._finished = true
+  if (this.part) this.part.destroy(cb)
+}
+
+MulitpartStream.prototype._read = function MultipartStream__read (size) {
+  if (this.part && this.part.readable && !this._finished) this.part.resume()
 }
 
 /**
@@ -1002,7 +1029,7 @@ function containsDotFile (parts) {
  *
  * @param {string} type
  * @param {number} size
- * @param {array} [range]
+ * @param {object} [range]
  */
 
 function contentRange (type, size, range) {
