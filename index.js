@@ -538,12 +538,7 @@ SendStream.prototype.pipe = function pipe (res) {
     }
   }
 
-  onFinished(res, function () {
-    return typeof self.fd === 'number' && fs.close(self.fd, function () {
-      debug('closed the fd "%d"', self.fd)
-      self.fd = null
-    })
-  })
+  onFinished(res, destroy.bind(null, this))
 
   // index file support
   if (this._index.length && this.path[this.path.length - 1] === '/') this.sendIndex(path)
@@ -787,23 +782,18 @@ SendStream.prototype.sendIndex = function sendIndex (path) {
 
 SendStream.prototype.stream = function stream (path, options) {
   // TODO: this is all lame, refactor meeee
-  var finished = false
   var self = this
+  var req = this.req
   var res = this.res
-  var stream = options.ranges
+  var stream = this.stream = options.ranges
     ? new MulitpartStream(path, options)
     : fs.createReadStream(path, options)
 
   debug('got stream')
 
-  function cleanup () {
-    finished = true
-    destroy(stream)
-  }
-
   function open (fd) {
     self.emit('open', fd)
-    if (!finished) stream.pipe(res) // pipe
+    if (!self.finished) stream.pipe(res) // pipe
   }
 
   this.emit('stream', stream)
@@ -812,22 +802,15 @@ SendStream.prototype.stream = function stream (path, options) {
     : stream.on('open', open)
 
   // request aborted
-  this.req.on('aborted', function onaborted () {
+  req.on('aborted', function onaborted () {
     debug('request aborted')
-    cleanup()
     res.end()
   })
-
-  // response finished
-  onFinished(res, cleanup)
 
   // error handling code-smell
   stream.on('error', function onerror (err) {
     // request already finished
-    if (finished) return
-
-    // clean up stream
-    cleanup()
+    if (self.finished) return
 
     // error
     self.onStatError(err)
@@ -846,6 +829,21 @@ SendStream.prototype.stream = function stream (path, options) {
   stream.on('close', function onclose () {
     self.emit('close')
   })
+}
+
+/**
+ * Stream `path` to the response.
+ *
+ * @param {String} path
+ * @param {Object} options
+ * @api private
+ */
+
+SendStream.prototype.destroy = function SendStream_destroy (cb) {
+  if (!this.destroyed && this.stream && !this.stream.destroyed) {
+    this.finished = this.destroyed = true
+    destroy(this.stream)
+  }
 }
 
 /**
@@ -910,12 +908,12 @@ SendStream.prototype.setHeader = function setHeader (path, stat) {
 util.inherits(MulitpartStream, Readable)
 
 function MulitpartStream (path, opts) {
-  var part
   var self = this
   var fd = opts.fd
   var ranges = opts.ranges
   var hwm = opts.highWaterMark
   var headers = opts.partHeaders
+  var autoClose = opts.autoClose || true
   Readable.call(this, opts)
   if (typeof opts.fd === 'number') return beginMultipartStream(self.fd = fd)
   fs.open(path, 'r', function (err, fd) {
@@ -926,21 +924,21 @@ function MulitpartStream (path, opts) {
 
   function beginMultipartStream (fd) {
     asyncSeries(ranges, function streamPart (range, idx, next) {
-      if (self._finished) return next()
+      if (self.finished) return next()
       var isLast = idx >= ranges.length - 1
       range.fd = fd
-      range.autoClose = isLast
+      range.autoClose = autoClose && isLast
       range.highWaterMark = hwm
-      self.part = part = fs.createReadStream(path, range)
+      var part = self.part = fs.createReadStream(path, range)
       part.bufferSize = hwm
       self.emit('part', part)
       part.on('error', next)
       part.on('end', function () {
-        if (!isLast) part.fd = null // prevent node.js < 0.10 from closing the fd
+        if (!(isLast && autoClose)) part.fd = null // prevent node.js < 0.10 from closing the fd
         next()
       })
       part.once('data', function () {
-        self.push(headers[idx])
+        self.push(headers[idx]) // write part headers first
       })
       part.on('data', function (data) {
         // istanbul ignore if: response buffer would need to be filled above high water mark
@@ -950,9 +948,9 @@ function MulitpartStream (path, opts) {
         self.emit('close')
       })
     }, function sentParts (err) {
-      if (self._finished) return
+      if (self.finished) return
       if (err) {
-        self._finished = true
+        self.finished = true
         // istanbul ignore next: node.js < 0.10 doesn't close the fd on error
         if (!part.destroyed) {
           fs.close(fd, function (e) {
@@ -970,12 +968,12 @@ function MulitpartStream (path, opts) {
 }
 
 MulitpartStream.prototype.destroy = function MultipartStream_destroy (cb) {
-  this._finished = true
+  this.destroyed = this.finished = true
   if (this.part) this.part.destroy(cb)
 }
 
 MulitpartStream.prototype._read = function MultipartStream__read (size) {
-  if (this.part && this.part.readable && !this._finished) this.part.resume()
+  if (this.part && this.part.readable && !this.finished) this.part.resume()
 }
 
 /**
