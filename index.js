@@ -30,17 +30,44 @@ var path = require('path')
 var statuses = require('statuses')
 var Stream = require('stream')
 var util = require('util')
+var Readable = require('readable-stream')
 
 /**
  * Path function references.
  * @private
  */
 
+var basename = path.basename
 var extname = path.extname
 var join = path.join
 var normalize = path.normalize
 var resolve = path.resolve
 var sep = path.sep
+
+/**
+ * No-op function
+ * @private
+ */
+var noop = Function.prototype
+
+/**
+ * Polyfill for setImmediate
+ * @private
+ */
+/* istanbul ignore next */
+var defer = typeof setImmediate === 'function'
+  ? setImmediate
+  : function(fn){ process.nextTick(fn.bind.apply(fn, arguments)) }
+
+
+var ATTACHMENT = 'attachment; filename="%s"; filename*=UTF-8\'\'%s'
+
+/**
+ * Internet standard newline RFC 5234 B.1
+ * @private
+ */
+
+var CRLF = '\r\n'
 
 /**
  * Regular expression for identifying a bytes Range header.
@@ -68,29 +95,18 @@ var UP_PATH_REGEXP = /(?:^|[\\\/])\.\.(?:[\\\/]|$)/
  * @public
  */
 
-module.exports = send
+module.exports = SendStream
 module.exports.mime = mime
 
 /**
- * Shim EventEmitter.listenerCount for node.js < 0.10
+ * Shim EventEmitter.prototype.listenerCount for node.js < 3.2.0
  */
 
-/* istanbul ignore next */
-var listenerCount = EventEmitter.listenerCount ||
-  function (emitter, type) { return emitter.listeners(type).length }
-
-/**
- * Return a `SendStream` for `req` and `path`.
- *
- * @param {object} req
- * @param {string} path
- * @param {object} [options]
- * @return {SendStream}
- * @public
- */
-
-function send (req, path, options) {
-  return new SendStream(req, path, options)
+/* istanbul ignore next: node.js < 3.2.0 does not have a native listenerCount */
+if (!EventEmitter.prototype.listenerCount) {
+  EventEmitter.prototype.listenerCount = function listenerCount (type) {
+    return this.listeners(type).length
+  }
 }
 
 /**
@@ -103,6 +119,7 @@ function send (req, path, options) {
  */
 
 function SendStream (req, path, options) {
+  if (!(this instanceof SendStream)) return new SendStream(req, path, options)
   Stream.call(this)
 
   var opts = options || {}
@@ -277,7 +294,7 @@ SendStream.prototype.maxage = deprecate.function(function maxage (maxAge) {
 
 SendStream.prototype.error = function error (status, error) {
   // emit if listeners instead of responding
-  if (listenerCount(this, 'error') !== 0) {
+  if (this.listenerCount('error') !== 0) {
     return this.emit('error', createError(error, status, {
       expose: false
     }))
@@ -285,6 +302,9 @@ SendStream.prototype.error = function error (status, error) {
 
   var res = this.res
   var msg = statuses[status]
+
+  // do not set headers if they have already been sent
+  if (res._headerSent) return res.end()
 
   // clear existing headers
   clearHeaders(res)
@@ -441,15 +461,8 @@ SendStream.prototype.isRangeFresh = function isRangeFresh () {
  */
 
 SendStream.prototype.redirect = function redirect (path) {
-  if (listenerCount(this, 'directory') !== 0) {
-    this.emit('directory')
-    return
-  }
-
-  if (this.hasTrailingSlash()) {
-    this.error(403)
-    return
-  }
+  if (this.listenerCount('directory')) return this.emit('directory')
+  if (this.hasTrailingSlash()) return this.error(403)
 
   var loc = encodeUrl(collapseLeadingSlashes(path + '/'))
   var msg = 'Redirecting to <a href="' + escapeHtml(loc) + '">' + escapeHtml(loc) + '</a>\n'
@@ -482,13 +495,16 @@ SendStream.prototype.pipe = function pipe (res) {
 
   // response finished, done with the fd
   onFinished(res, function onfinished () {
-    var fd = self.fd
-    var autoClose = self.options.autoClose
+    var autoClose = self.options.autoClose !== false
     if (self._stream) destroy(self._stream)
-    if (typeof fd === 'number' && autoClose !== false) {
-      fs.close(fd, function () {
-        self.fd = null
-        self.emit('close')
+    if (typeof self.fd === 'number' && autoClose) {
+      defer(function () {
+        fs.close(self.fd, function (err) {
+          /* istanbul ignore next */
+          if (err && err.code !== 'EBADF') return self.onFileSystemError(err)
+          self.fd = null
+          self.emit('close')
+        })
       })
     }
   })
@@ -649,14 +665,22 @@ SendStream.prototype.send = function send (path, stat) {
       })
     }
 
-    // valid (syntactically invalid/multiple ranges are treated as a regular response)
-    if (ranges !== -2 && ranges.length === 1) {
+    // valid (syntactically invalid treated as a regular response)
+    if (ranges !== -2) {
       debug('range %j', ranges)
 
       // Content-Range
       res.statusCode = 206
-      res.setHeader('Content-Range', contentRange('bytes', len, ranges[0]))
 
+      if (ranges.length > 1) {
+        opts = this.setMultipartHeader(path, stat, ranges)
+        // HEAD support
+        return req.method === 'HEAD'
+          ? res.end()
+          : this.stream(path, opts)
+      }
+
+      res.setHeader('Content-Range', contentRange('bytes', len, ranges[0]))
       // adjust for requested range
       offset += ranges[0].start
       len = ranges[0].end - ranges[0].start + 1
@@ -676,12 +700,9 @@ SendStream.prototype.send = function send (path, stat) {
   res.setHeader('Content-Length', len)
 
   // HEAD support
-  if (req.method === 'HEAD') {
-    res.end()
-    return
-  }
-
-  this.stream(path, opts)
+  return req.method === 'HEAD'
+    ? res.end()
+    : this.stream(path, opts)
 }
 
 /**
@@ -758,8 +779,8 @@ SendStream.prototype.sendIndex = function sendIndex (path) {
       debug('stat fd "%d" for path "%s"', fd, p)
       fs.fstat(fd, function (err, stat) {
         if (err || stat.isDirectory()) {
-          return fs.close(fd, function () {
-            next(err)
+          return fs.close(fd, function (e) {
+            next(err || e)
           })
         }
         self.fd = fd
@@ -784,17 +805,19 @@ SendStream.prototype.stream = function stream (path, options) {
   options.autoClose = false
 
   var self = this
-  var stream = this._stream = fs.createReadStream(path, options)
+  var stream = this._stream = options.ranges
+    ? new MulitpartStream(options)
+    : fs.createReadStream(path, options)
 
   // error
   stream.on('error', function onerror (e) {
-    stream.fd = null
+    stream.fd = null // prevent node from closing our file descriptor
     self.onFileSystemError(e)
   })
 
   // end
   stream.on('end', function onend () {
-    stream.fd = null
+    stream.fd = null // prevent node from closing our file descriptor
     self.emit('end')
   })
 
@@ -865,6 +888,106 @@ SendStream.prototype.setHeader = function setHeader (path, stat) {
     debug('etag %s', val)
     res.setHeader('ETag', val)
   }
+}
+
+/**
+ * Set multipart headers and return options to pass to a `MultipartStream`
+ *
+ * @param {String} path
+ * @param {Object} stat
+ * @param {Array} ranges
+ * @api private
+ */
+
+SendStream.prototype.setMultipartHeader = function setMultipartHeader (path, stat, ranges) {
+  var res = this.res
+  var filename = basename(path)
+  var contentType = res.getHeader('Content-Type')
+  var disposition = !(/^(text|image)\//i.test(contentType))
+    ? util.format(ATTACHMENT, filename, encodeRFC5987ValueChars(filename))
+    : 'inline'
+  var boundary = 'BYTERANGE_' + Date.now().toString(36).toUpperCase()
+  var opts = {
+    ranges: ranges,
+    footer: CRLF + '--' + boundary + '--',
+    partHeaders: new Array(ranges.length),
+    highWaterMark: this.options.highWaterMark || 64 * 1024
+  }
+
+  // calculate content length
+  var len = opts.footer.length
+  for (var i = ranges.length - 1; i >= 0; i--) {
+    opts.partHeaders[i] = (
+      (i ? CRLF : '') +
+      '--' + boundary + CRLF +
+      'Content-Type: ' + contentType + CRLF +
+      'Content-Range: ' + contentRange('bytes', stat.size, ranges[i]) + CRLF +
+      CRLF
+    )
+    len += opts.partHeaders[i].length
+    len += ranges[i].end - ranges[i].start + 1
+  }
+
+  // set multipart headers
+  res.setHeader('Content-Disposition', disposition)
+  res.setHeader('Content-Length', len)
+  res.setHeader('Content-Type', 'multipart/byteranges; boundary=' + boundary)
+  return opts
+}
+
+util.inherits(MulitpartStream, Readable)
+
+function MulitpartStream (opts) {
+  Readable.call(this, opts)
+  this.fd = opts.fd
+  var self = this
+
+  asyncSeries(opts.ranges, function sendParts (range, idx, next) {
+    if (self.finished) return next(true)
+
+    // Set ReadStream options
+    range.fd = self.fd
+    range.autoClose = false
+    range.highWaterMark = opts.highWaterMark
+    var part = self.part = fs.createReadStream(null, range)
+
+    /* istanbul ignore if: prevent node.js < 0.10 from closing the fd */
+    if (part.autoClose !== false) {
+      part.close = part.destroy = noop
+      part.bufferSize = opts.highWaterMark
+    }
+
+    // Set ReadStream event handlers
+    part.on('error', next)
+    part.on('end', next)
+    part.once('data', function partHeader () { self.push(opts.partHeaders[idx]) })
+    part.on('data', function partData (data) { self.push(data) || part.pause() })
+    self.emit('part', part)
+  }, function sentParts (err) {
+    if (self.finished) return
+    if (err) {
+      self.emit('error', err)
+    } else {
+      self.push(opts.footer)
+    }
+    self.close()
+  })
+}
+
+MulitpartStream.prototype.destroy = function destroy_MultipartStream () {
+  if (this.destroyed) return
+  this.destroyed = true
+  this.close()
+}
+
+MulitpartStream.prototype.close = function close_MultipartStream () {
+  if (this.closed) return
+  this.readable = !(this.finished = this.closed = !(this.part = null))
+  this.push(null)
+}
+
+MulitpartStream.prototype._read = function _read_MulitpartStream () {
+  if (this.part && this.part.readable && !this.finished) this.part.resume()
 }
 
 /**
@@ -977,5 +1100,60 @@ function setHeaders (res, headers) {
   for (var i = 0; i < keys.length; i++) {
     var key = keys[i]
     res.setHeader(key, headers[key])
+  }
+}
+
+/**
+ * Encode a string per RFC5987
+ * https://mdn.io/encodeURIComponent#Examples
+ *
+ * @param {string} str
+ * @private
+ */
+
+function encodeRFC5987ValueChars (str) {
+  return encodeURIComponent(str).
+    // Note that although RFC3986 reserves "!", RFC5987 does not,
+    // so we do not need to escape it
+    replace(/['()]/g, escape). // i.e., %27 %28 %29
+    replace(/\*/g, '%2A').
+      // The following are not required for percent-encoding per RFC5987,
+      // so we can allow for a little better readability over the wire: |`^
+      replace(/%(?:7C|60|5E)/g, unescape);
+}
+
+/**
+ * Applies the function `iteratee` to each item in `array` asynchronously in serial.
+ * The iteratee is called with an item from the array, its index, and a callback (next)
+ * for when it has finished. If the iteratee passes an error to its callback,
+ * the main callback (done) is immediately called with the error.
+ *
+ * @param {array} array
+ * @param {function} iteratee
+ * @param {function} done
+ * @private
+ */
+
+function asyncSeries (array, iteratee, done) {
+  var i = 0
+  var total = array.length
+  return (function next (err) {
+    if (err || i >= total) done(err)
+    else if (i) defer(iteratee, array[i], i++, once(next))
+    else iteratee(array[i], i++, once(next))
+  })()
+}
+
+/**
+ * Only allow a function to run once
+ *
+ * @param {function} fn
+ * @private
+ */
+
+function once (fn) {
+  var ran
+  return function () {
+    return ran || (ran = true, fn.apply(null, arguments))
   }
 }
