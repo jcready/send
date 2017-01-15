@@ -1,12 +1,36 @@
 
 process.env.NO_DEPRECATION = 'send'
 
-var after = require('after')
+var afterCalls = require('after')
 var assert = require('assert')
 var fs = require('fs')
 var http = require('http')
 var path = require('path')
 var request = require('supertest')
+var os = require('os')
+
+// Prevent node.js >= 7 from complaining
+if (os.tmpdir) os.tmpDir = function () { return os.tmpdir.apply(os, arguments) }
+
+// Allow us to test process.nextTick calls by performing two for the code we're testing
+var nextTick = process.nextTick
+var immediate = global.setImmediate
+process.nextTick = function () {
+  var args = arguments
+  return nextTick(function () {
+    return nextTick.apply(null, args)
+  })
+}
+
+if (typeof immediate === 'function') {
+  global.setImmediate = function () {
+    var args = arguments
+    return immediate(function () {
+      return immediate.apply(null, args)
+    })
+  }
+}
+
 var send = require('..')
 
 // test server
@@ -28,9 +52,9 @@ var app = http.createServer(function (req, res) {
 // responses while using SuperTest. The SuperAgent `.parse()`
 // method doesn't work correctly when using SuperTest.
 var formidable
-try {
+try { // npm v3
   formidable = require('formidable')
-} catch (e) {
+} catch (e) { // npm v2
   formidable = require('supertest/node_modules/superagent/node_modules/formidable')
 }
 formidable.IncomingForm.prototype.parse = function parseByteRanges (res, done) {
@@ -52,13 +76,16 @@ formidable.IncomingForm.prototype.parse = function parseByteRanges (res, done) {
 
 var fsOpen = fs.open
 var fsClose = fs.close
-var fds = {
-  opened: 0,
-  closed: 0
-}
-
+var fds = { opened: 0, closed: 0 }
+// Before any of the tests run wrap `fs.open()` and `fs.close()`
+// so we can test that all the file descriptors that get opened
+// by `send()` are also closed properly after each response
 before(function () {
-  fs.open = function () {
+  // When `fs.open()` is called we wrap the last argument (the
+  // callback which receives the file descriptor) so that when
+  // it is evuantually called we can increment the number of
+  // opened file descriptors
+  fs.open = function wrapped_fs_open () {
     var args = Array.prototype.slice.call(arguments)
     var last = args.length - 1
     var done = args[last]
@@ -68,17 +95,25 @@ before(function () {
     }
     return fsOpen.apply(fs, args)
   }
-  fs.close = function (fd, cb) {
-    fds.closed++
+
+  // When `fs.close()` is called we increment the number of closed
+  // file descriptors immediately since closing is asynchronous and
+  // we check after each response that any opened file descriptors
+  // will eventually be closed, not necessarily that they *are* now
+  fs.close = function wrapped_fs_close (fd, cb) {
+    if (typeof fd === 'number') fds.closed++
     return fsClose.call(fs, fd, cb)
   }
 })
 
+// After all the tests have run then restore `fs.open()`
+// and `fs.close()` to their original un-wrapped versions
 after(function () {
   fs.open = fsOpen
   fs.close = fsClose
 })
 
+// After each test: ensure all opened file descriptors have been closed
 afterEach(function () {
   var reason = 'all opened file descriptors (' + fds.opened + ') should have been closed (' + fds.closed + ')'
   assert.equal(fds.closed, fds.opened, reason)
@@ -240,7 +275,7 @@ describe('send(file).pipe(res)', function () {
       send(req, req.url, {root: 'test/fixtures'})
       .on('stream', function (stream) {
         // simulate file error
-        process.nextTick(function () {
+        nextTick(function () {
           stream.emit('error', new Error('boom!'))
         })
       })
@@ -254,7 +289,7 @@ describe('send(file).pipe(res)', function () {
 
   describe('"headers" event', function () {
     it('should fire when sending file', function (done) {
-      var cb = after(2, done)
+      var cb = afterCalls(2, done)
       var server = http.createServer(function (req, res) {
         send(req, req.url, {root: fixtures})
         .on('headers', function () { cb() })
@@ -267,7 +302,7 @@ describe('send(file).pipe(res)', function () {
     })
 
     it('should not fire on 404', function (done) {
-      var cb = after(1, done)
+      var cb = afterCalls(1, done)
       var server = http.createServer(function (req, res) {
         send(req, req.url, {root: fixtures})
         .on('headers', function () { cb() })
@@ -280,7 +315,7 @@ describe('send(file).pipe(res)', function () {
     })
 
     it('should fire on index', function (done) {
-      var cb = after(2, done)
+      var cb = afterCalls(2, done)
       var server = http.createServer(function (req, res) {
         send(req, req.url, {root: fixtures})
         .on('headers', function () { cb() })
@@ -293,7 +328,7 @@ describe('send(file).pipe(res)', function () {
     })
 
     it('should not fire on redirect', function (done) {
-      var cb = after(1, done)
+      var cb = afterCalls(1, done)
       var server = http.createServer(function (req, res) {
         send(req, req.url, {root: fixtures})
         .on('headers', function () { cb() })
@@ -306,7 +341,7 @@ describe('send(file).pipe(res)', function () {
     })
 
     it('should provide path', function (done) {
-      var cb = after(2, done)
+      var cb = afterCalls(2, done)
       var server = http.createServer(function (req, res) {
         send(req, req.url, {root: fixtures})
         .on('headers', onHeaders)
@@ -325,7 +360,7 @@ describe('send(file).pipe(res)', function () {
     })
 
     it('should provide stat', function (done) {
-      var cb = after(2, done)
+      var cb = afterCalls(2, done)
       var server = http.createServer(function (req, res) {
         send(req, req.url, {root: fixtures})
         .on('headers', onHeaders)
@@ -579,10 +614,14 @@ describe('send(file).pipe(res)', function () {
 
     // 0-3,4-6,7-10,11-13,14-17,18-20,21-24
     describe('when multiple ranges', function () {
+      var unicode = encodeURIComponent('fun-with-ŭȵỉȼợḏⱻ')
+      var unicodeDisposition = new RegExp('^attachment; filename="([\\x00-\\x7F]+)"; filename\\*=UTF-8\'\'' + unicode + '$', 'i')
+      var multipartByteRanges = /multipart\/byteranges;\sboundary=BYTERANGE_[A-Z0-9]+/
+
       describe('which can be combined', function () {
         it('should respond with normal 206', function (done) {
           request(app)
-          .get('/unicode')
+          .get('/' + unicode)
           .set('Range', 'bytes=17-27,28-30,31-34')
           .expect('Content-Range', 'bytes 17-34/35')
           .expect(206, '👩‍👧‍👦', done)
@@ -592,10 +631,10 @@ describe('send(file).pipe(res)', function () {
       describe('which cannot be combined', function () {
         it('should respond with multipart 206', function (done) {
           request(app)
-          .get('/unicode')
+          .get('/' + unicode)
           .set('Range', 'bytes=10-13,24-27,31-34')
-          .expect('Content-Disposition', 'attachment; filename="unicode"; filename*=UTF-8\'\'unicode')
-          .expect('Content-Type', /multipart\/byteranges;\sboundary=BYTERANGE_[A-Z0-9]+/)
+          .expect('Content-Disposition', unicodeDisposition)
+          .expect('Content-Type', multipartByteRanges)
           .expect('Content-Length', '325')
           .expect(206, [
             {
@@ -624,10 +663,10 @@ describe('send(file).pipe(res)', function () {
 
         it('should support HEAD', function (done) {
           request(app)
-          .head('/unicode')
+          .head('/' + unicode)
           .set('Range', 'bytes=10-13,24-27,31-34')
-          .expect('Content-Disposition', 'attachment; filename="unicode"; filename*=UTF-8\'\'unicode')
-          .expect('Content-Type', /multipart\/byteranges;\sboundary=BYTERANGE_[A-Z0-9]+/)
+          .expect('Content-Disposition', unicodeDisposition)
+          .expect('Content-Type', multipartByteRanges)
           .expect('Content-Length', '325')
           .expect(206, undefined, done)
         })
@@ -683,8 +722,10 @@ describe('send(file).pipe(res)', function () {
         it('should handle response ending before streaming finished', function (done) {
           var app = http.createServer(function (req, res) {
             send(req, req.url, {root: 'test/fixtures'})
-            .on('stream', function (s) {
-              process.nextTick(function () { res.end() })
+            .on('stream', function (stream) {
+              stream.on('part', function (part) {
+                res.end()
+              })
             })
             .pipe(res)
           })
@@ -692,31 +733,15 @@ describe('send(file).pipe(res)', function () {
           request(app)
           .get('/nums')
           .set('Range', 'bytes=0-1,3-3,5-6,7-8')
-          .expect(206, [], done)
-        })
-
-        it('should handle request aborting before streaming finished', function (done) {
-          var server = app.listen()
-          var clientReq = http.request({
-            port: server.address().port,
-            path: '/nums',
-            headers: { 'Range': 'bytes=0-1,3-3,5-6,7-8' }
-          })
-          var end = function (e) {
-            server.close(function (err) {
-              done(e || err)
-            })
-          }
-
-          clientReq.on('response', function (res) {
-            assert.equal(res.statusCode, 206, 'correct status code')
-            process.nextTick(function () { clientReq.abort() })
-            formidable.IncomingForm.prototype.parse(res, function (err, actual) {
-              if (err) return end(err)
-              assert.ok(actual.length && actual.length < 3, 'at least one part received, but not entire response')
-              end()
-            })
-          }).end()
+          .expect(206, [
+            {
+              body: '12',
+              headers: {
+                'content-range': 'bytes 0-1/9',
+                'content-type': 'application/octet-stream'
+              }
+            }
+          ], done)
         })
 
         it('should stop streaming parts if any stream failed beyond the first', function (done) {
@@ -733,29 +758,15 @@ describe('send(file).pipe(res)', function () {
           request(app)
           .get('/nums')
           .set('Range', 'bytes=0-1,3-3,5-6,7-8')
-          .expect(function (res) {
-            var parts = res.body
-            assert.equal(parts.length, 1, 'sent just one part')
-            assert.equal(parts[0].headers['content-range'], 'bytes 0-1/9', 'sent correct headers for part')
-            assert.ok(parts[0].body === '12', 'the first multipart body was "12"')
-          })
-          .expect(206, done)
-        })
-
-        it('should handle back pressure', function (done) {
-          var app = http.createServer(function (req, res) {
-            try {
-              res.socket._writableState.highWaterMark = 1
-              res.connection._writableState.highWaterMark = 1
-            } catch (e) {}
-            send(req, req.url, {root: 'test/fixtures', highWaterMark: 2 })
-            .pipe(res)
-          })
-
-          request(app)
-          .get('/nums')
-          .set('Range', 'bytes=0-1,3-3,5-6,7-8')
-          .expect(206, done)
+          .expect(206, [
+            {
+              body: '12',
+              headers: {
+                'content-range': 'bytes 0-1/9',
+                'content-type': 'application/octet-stream'
+              }
+            }
+          ], done)
         })
 
         it('should handle the unlying stream becoming destroyed', function (done) {
@@ -772,7 +783,40 @@ describe('send(file).pipe(res)', function () {
           request(app)
           .get('/nums')
           .set('Range', 'bytes=0-1,3-3,5-6,7-8')
-          .expect(206, done)
+          .expect(206, [
+            {
+              body: '12',
+              headers: {
+                'content-range': 'bytes 0-1/9',
+                'content-type': 'application/octet-stream'
+              }
+            }
+          ], done)
+        })
+
+        it('should handle request aborting before streaming finished', function (done) {
+          var server = app.listen()
+          var clientReq = http.request({
+            port: server.address().port,
+            path: '/nums',
+            headers: { 'Range': 'bytes=0-1,3-3,5-6,7-8' }
+          })
+          var abort = clientReq.abort.bind(clientReq)
+          var end = function (e) {
+            server.close(function (err) {
+              done(e || err)
+            })
+          }
+
+          clientReq.on('response', function (res) {
+            assert.equal(res.statusCode, 206, 'correct status code')
+            nextTick(abort)
+            formidable.IncomingForm.prototype.parse(res, function (err, actual) {
+              if (err) return end(err)
+              assert.ok(actual.length && actual.length < 3, 'at least one part received, but not entire response')
+              end()
+            })
+          }).end()
         })
       })
     })
@@ -1572,17 +1616,18 @@ function shouldNotHaveHeader (header) {
 }
 
 function parseMultipartBody (body, boundary) {
-  return body.split('--' + boundary).filter(function (part) {
-    return part && part !== '--'
-  }).map(function (part) {
-    var headBody = part.trim().split(/\r\n\r\n/g)
-    return {
-      headers: headBody[0].split(/\r\n/).reduce(function (memo, header) {
-        var keyVal = header.split(/:\s+/)
-        memo[keyVal[0].toLowerCase()] = keyVal[1]
-        return memo
-      }, {}),
-      body: headBody[1]
+  return body.split('--' + boundary).reduce(function (memo, part) {
+    if (part && part !== '--') {
+      var headBody = part.trim().split(/\r\n\r\n/g)
+      memo.push({
+        headers: headBody[0].split(/\r\n/).reduce(function (memo, header) {
+          var keyVal = header.split(/:\s+/)
+          memo[keyVal[0].toLowerCase()] = keyVal[1]
+          return memo
+        }, {}),
+        body: headBody[1]
+      })
     }
-  })
+    return memo
+  }, [])
 }

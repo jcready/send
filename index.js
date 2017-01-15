@@ -30,6 +30,7 @@ var path = require('path')
 var statuses = require('statuses')
 var Stream = require('stream')
 var util = require('util')
+var contentDisposition = require('content-disposition')
 var Readable = require('readable-stream')
 
 /**
@@ -45,22 +46,14 @@ var resolve = path.resolve
 var sep = path.sep
 
 /**
- * No-op function
- * @private
- */
-var noop = Function.prototype
-
-/**
  * Polyfill for setImmediate
  * @private
  */
+
 /* istanbul ignore next */
 var defer = typeof setImmediate === 'function'
   ? setImmediate
   : function(fn){ process.nextTick(fn.bind.apply(fn, arguments)) }
-
-
-var ATTACHMENT = 'attachment; filename="%s"; filename*=UTF-8\'\'%s'
 
 /**
  * Internet standard newline RFC 5234 B.1
@@ -150,7 +143,7 @@ function SendStream (req, path, options) {
 
   this._hidden = Boolean(opts.hidden)
 
-  if (opts.hidden !== undefined) {
+  if (opts.hidden !== undefined) { /* istanbul ignore next: only a deprecation warning */
     deprecate('hidden: use dotfiles: \'' + (this._hidden ? 'allow' : 'ignore') + '\' instead')
   }
 
@@ -352,13 +345,9 @@ SendStream.prototype.isConditionalGET = function isConditionalGET () {
  */
 
 SendStream.prototype.removeContentHeaderFields = function removeContentHeaderFields () {
-  var res = this.res
-  var headers = Object.keys(res._headers || {})
-
-  for (var i = 0; i < headers.length; i++) {
-    var header = headers[i]
-    if (header.substr(0, 8) === 'content-' && header !== 'content-location') {
-      res.removeHeader(header)
+  for (var header in this.res._headers) {
+    if (header.slice(0, 8) === 'content-' && header !== 'content-location') {
+      this.res.removeHeader(header)
     }
   }
 }
@@ -404,7 +393,7 @@ SendStream.prototype.isCachable = function isCachable () {
 }
 
 /**
- * Handle stat() error.
+ * Handle file system error.
  *
  * @param {Error} error
  * @private
@@ -496,15 +485,13 @@ SendStream.prototype.pipe = function pipe (res) {
   // response finished, done with the fd
   onFinished(res, function onfinished () {
     var autoClose = self.options.autoClose !== false
-    if (self._stream) destroy(self._stream)
+    if (self._stream) self._stream.destroy()
     if (typeof self.fd === 'number' && autoClose) {
-      defer(function () {
-        fs.close(self.fd, function (err) {
-          /* istanbul ignore next */
-          if (err && err.code !== 'EBADF') return self.onFileSystemError(err)
-          self.fd = null
-          self.emit('close')
-        })
+      fs.close(self.fd, function (err) {
+        /* istanbul ignore next */
+        if (err && err.code !== 'EBADF') return self.onFileSystemError(err)
+        self.fd = null
+        self.emit('close')
       })
     }
   })
@@ -677,7 +664,7 @@ SendStream.prototype.send = function send (path, stat) {
         // HEAD support
         return req.method === 'HEAD'
           ? res.end()
-          : this.stream(path, opts)
+          : this.stream(opts)
       }
 
       res.setHeader('Content-Range', contentRange('bytes', len, ranges[0]))
@@ -702,7 +689,7 @@ SendStream.prototype.send = function send (path, stat) {
   // HEAD support
   return req.method === 'HEAD'
     ? res.end()
-    : this.stream(path, opts)
+    : this.stream(opts)
 }
 
 /**
@@ -793,37 +780,32 @@ SendStream.prototype.sendIndex = function sendIndex (path) {
 }
 
 /**
- * Stream `path` to the response.
+ * Stream to the response.
  *
- * @param {String} path
  * @param {Object} options
  * @api private
  */
 
-SendStream.prototype.stream = function stream (path, options) {
+SendStream.prototype.stream = function stream (options) {
   options.fd = this.fd
   options.autoClose = false
 
-  var self = this
-  var stream = this._stream = options.ranges
-    ? new MulitpartStream(options)
-    : fs.createReadStream(path, options)
+  if (options.ranges) {
+    this._stream = new MultipartStream(options)
+  } else {
+    this._stream = fs.createReadStream(null, options)
+    this._stream.close = this._stream.destroy = fauxClose // prevent node.js < 0.10 from closing the fd
+  }
 
   // error
-  stream.on('error', function onerror (e) {
-    stream.fd = null // prevent node from closing our file descriptor
-    self.onFileSystemError(e)
-  })
+  this._stream.on('error', this.onFileSystemError)
 
   // end
-  stream.on('end', function onend () {
-    stream.fd = null // prevent node from closing our file descriptor
-    self.emit('end')
-  })
+  this._stream.on('end', this.emit.bind(this, 'end'))
 
   // pipe
-  this.emit('stream', stream)
-  stream.pipe(this.res)
+  this.emit('stream', this._stream)
+  this._stream.pipe(this.res)
 }
 
 /**
@@ -901,44 +883,40 @@ SendStream.prototype.setHeader = function setHeader (path, stat) {
 
 SendStream.prototype.setMultipartHeader = function setMultipartHeader (path, stat, ranges) {
   var res = this.res
-  var filename = basename(path)
-  var contentType = res.getHeader('Content-Type')
-  var disposition = !(/^(text|image)\//i.test(contentType))
-    ? util.format(ATTACHMENT, filename, encodeRFC5987ValueChars(filename))
-    : 'inline'
+  var type = res.getHeader('Content-Type')
   var boundary = 'BYTERANGE_' + Date.now().toString(36).toUpperCase()
   var opts = {
     ranges: ranges,
     footer: CRLF + '--' + boundary + '--',
-    partHeaders: new Array(ranges.length),
     highWaterMark: this.options.highWaterMark || 64 * 1024
   }
 
   // calculate content length
   var len = opts.footer.length
   for (var i = ranges.length - 1; i >= 0; i--) {
-    opts.partHeaders[i] = (
+    ranges[i].header = (
       (i ? CRLF : '') +
       '--' + boundary + CRLF +
-      'Content-Type: ' + contentType + CRLF +
+      'Content-Type: ' + type + CRLF +
       'Content-Range: ' + contentRange('bytes', stat.size, ranges[i]) + CRLF +
       CRLF
     )
-    len += opts.partHeaders[i].length
+    len += ranges[i].header.length
     len += ranges[i].end - ranges[i].start + 1
   }
 
   // set multipart headers
-  res.setHeader('Content-Disposition', disposition)
   res.setHeader('Content-Length', len)
   res.setHeader('Content-Type', 'multipart/byteranges; boundary=' + boundary)
+  res.setHeader('Content-Disposition', contentDisposition(path, { fallback: true }))
   return opts
 }
 
-util.inherits(MulitpartStream, Readable)
+util.inherits(MultipartStream, Readable)
 
-function MulitpartStream (opts) {
+function MultipartStream (opts) {
   Readable.call(this, opts)
+  this.autoClose = opts.autoClose
   this.fd = opts.fd
   var self = this
 
@@ -950,17 +928,13 @@ function MulitpartStream (opts) {
     range.autoClose = false
     range.highWaterMark = opts.highWaterMark
     var part = self.part = fs.createReadStream(null, range)
-
-    /* istanbul ignore if: prevent node.js < 0.10 from closing the fd */
-    if (part.autoClose !== false) {
-      part.close = part.destroy = noop
-      part.bufferSize = opts.highWaterMark
-    }
+    part.close = part.destroy = fauxClose // prevent node.js < 0.10 from closing the fd
+    part.bufferSize = opts.highWaterMark
 
     // Set ReadStream event handlers
     part.on('error', next)
     part.on('end', next)
-    part.once('data', function partHeader () { self.push(opts.partHeaders[idx]) })
+    part.once('data', function partHeader () { self.push(range.header, 'ascii') })
     part.on('data', function partData (data) { self.push(data) || part.pause() })
     self.emit('part', part)
   }, function sentParts (err) {
@@ -974,20 +948,21 @@ function MulitpartStream (opts) {
   })
 }
 
-MulitpartStream.prototype.destroy = function destroy_MultipartStream () {
+MultipartStream.prototype.destroy = function destroy_MultipartStream () {
   if (this.destroyed) return
+  if (this.part) this.part.destroy()
   this.destroyed = true
   this.close()
 }
 
-MulitpartStream.prototype.close = function close_MultipartStream () {
+MultipartStream.prototype.close = function close_MultipartStream () {
   if (this.closed) return
   this.readable = !(this.finished = this.closed = !(this.part = null))
   this.push(null)
 }
 
-MulitpartStream.prototype._read = function _read_MulitpartStream () {
-  if (this.part && this.part.readable && !this.finished) this.part.resume()
+MultipartStream.prototype._read = function _read_MultipartStream () {
+  return this.part && this.part.readable && !this.finished && this.part.resume()
 }
 
 /**
@@ -1104,25 +1079,6 @@ function setHeaders (res, headers) {
 }
 
 /**
- * Encode a string per RFC5987
- * https://mdn.io/encodeURIComponent#Examples
- *
- * @param {string} str
- * @private
- */
-
-function encodeRFC5987ValueChars (str) {
-  return encodeURIComponent(str).
-    // Note that although RFC3986 reserves "!", RFC5987 does not,
-    // so we do not need to escape it
-    replace(/['()]/g, escape). // i.e., %27 %28 %29
-    replace(/\*/g, '%2A').
-      // The following are not required for percent-encoding per RFC5987,
-      // so we can allow for a little better readability over the wire: |`^
-      replace(/%(?:7C|60|5E)/g, unescape);
-}
-
-/**
  * Applies the function `iteratee` to each item in `array` asynchronously in serial.
  * The iteratee is called with an item from the array, its index, and a callback (next)
  * for when it has finished. If the iteratee passes an error to its callback,
@@ -1156,4 +1112,16 @@ function once (fn) {
   return function () {
     return ran || (ran = true, fn.apply(null, arguments))
   }
+}
+
+/**
+ * A function to override ReadStream's `close` and `destroy`
+ * functions to pervent it from closing the file descriptor
+ *
+ * @param {function} cb
+ * @private
+ */
+
+function fauxClose () {
+  this.readable = !(this.destroyed = this.closed = !(this.fd = null))
 }
