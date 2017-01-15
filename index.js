@@ -790,12 +790,9 @@ SendStream.prototype.stream = function stream (options) {
   options.fd = this.fd
   options.autoClose = false
 
-  if (options.ranges) {
-    this._stream = new MultipartStream(options)
-  } else {
-    this._stream = fs.createReadStream(null, options)
-    this._stream.close = this._stream.destroy = fauxClose // prevent node.js < 0.10 from closing the fd
-  }
+  this._stream = options.ranges
+    ? new MultipartStream(options)
+    : new PartStream(options)
 
   // error
   this._stream.on('error', this.onFileSystemError)
@@ -912,6 +909,17 @@ SendStream.prototype.setMultipartHeader = function setMultipartHeader (path, sta
   return opts
 }
 
+util.inherits(PartStream, fs.ReadStream)
+
+function PartStream (opts) {
+  fs.ReadStream.call(this, null, opts)
+  this.bufferSize = opts.highWaterMark || this.bufferSize
+}
+
+PartStream.prototype.destroy = PartStream.prototype.close = function close_PartStream () {
+  this.readable = !(this.destroyed = this.closed = !(this.fd = null))
+}
+
 util.inherits(MultipartStream, Readable)
 
 function MultipartStream (opts) {
@@ -921,15 +929,13 @@ function MultipartStream (opts) {
   var self = this
 
   asyncSeries(opts.ranges, function sendParts (range, idx, next) {
-    if (self.finished) return next(true)
+    if (self.closed) return next(true)
 
     // Set ReadStream options
     range.fd = self.fd
     range.autoClose = false
     range.highWaterMark = opts.highWaterMark
-    var part = self.part = fs.createReadStream(null, range)
-    part.close = part.destroy = fauxClose // prevent node.js < 0.10 from closing the fd
-    part.bufferSize = opts.highWaterMark
+    var part = self.part = new PartStream(range)
 
     // Set ReadStream event handlers
     part.on('error', next)
@@ -938,7 +944,7 @@ function MultipartStream (opts) {
     part.on('data', function partData (data) { self.push(data) || part.pause() })
     self.emit('part', part)
   }, function sentParts (err) {
-    if (self.finished) return
+    if (self.closed) return
     if (err) {
       self.emit('error', err)
     } else {
@@ -957,12 +963,12 @@ MultipartStream.prototype.destroy = function destroy_MultipartStream () {
 
 MultipartStream.prototype.close = function close_MultipartStream () {
   if (this.closed) return
-  this.readable = !(this.finished = this.closed = !(this.part = null))
+  this.readable = !(this.closed = !(this.part = null))
   this.push(null)
 }
 
 MultipartStream.prototype._read = function _read_MultipartStream () {
-  return this.part && this.part.readable && !this.finished && this.part.resume()
+  return this.part && this.part.readable && !this.closed && this.part.resume()
 }
 
 /**
@@ -1112,16 +1118,4 @@ function once (fn) {
   return function () {
     return ran || (ran = true, fn.apply(null, arguments))
   }
-}
-
-/**
- * A function to override ReadStream's `close` and `destroy`
- * functions to pervent it from closing the file descriptor
- *
- * @param {function} cb
- * @private
- */
-
-function fauxClose () {
-  this.readable = !(this.destroyed = this.closed = !(this.fd = null))
 }
