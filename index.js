@@ -15,7 +15,6 @@
 var createError = require('http-errors')
 var debug = require('debug')('send')
 var deprecate = require('depd')('send')
-var destroy = require('destroy')
 var encodeUrl = require('encodeurl')
 var escapeHtml = require('escape-html')
 var etag = require('etag')
@@ -38,7 +37,6 @@ var Readable = require('readable-stream')
  * @private
  */
 
-var basename = path.basename
 var extname = path.extname
 var join = path.join
 var normalize = path.normalize
@@ -53,7 +51,7 @@ var sep = path.sep
 /* istanbul ignore next */
 var defer = typeof setImmediate === 'function'
   ? setImmediate
-  : function(fn){ process.nextTick(fn.bind.apply(fn, arguments)) }
+  : function (fn) { process.nextTick(fn.bind.apply(fn, arguments)) }
 
 /**
  * Internet standard newline RFC 5234 B.1
@@ -916,7 +914,7 @@ function PartStream (opts) {
   this.bufferSize = opts.highWaterMark || this.bufferSize
 }
 
-PartStream.prototype.destroy = PartStream.prototype.close = function close_PartStream () {
+PartStream.prototype.destroy = PartStream.prototype.close = function closePartStream () {
   this.readable = !(this.destroyed = this.closed = !(this.fd = null))
 }
 
@@ -954,20 +952,20 @@ function MultipartStream (opts) {
   })
 }
 
-MultipartStream.prototype.destroy = function destroy_MultipartStream () {
+MultipartStream.prototype.destroy = function destroyMultipartStream () {
   if (this.destroyed) return
   if (this.part) this.part.destroy()
   this.destroyed = true
   this.close()
 }
 
-MultipartStream.prototype.close = function close_MultipartStream () {
+MultipartStream.prototype.close = function closeMultipartStream () {
   if (this.closed) return
   this.readable = !(this.closed = !(this.part = null))
   this.push(null)
 }
 
-MultipartStream.prototype._read = function _read_MultipartStream () {
+MultipartStream.prototype._read = function readMultipartStream () {
   return this.part && this.part.readable && !this.closed && this.part.resume()
 }
 
@@ -1116,6 +1114,6 @@ function asyncSeries (array, iteratee, done) {
 function once (fn) {
   var ran
   return function () {
-    return ran || (ran = true, fn.apply(null, arguments))
+    return ran || ((ran = true) && fn.apply(null, arguments))
   }
 }

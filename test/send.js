@@ -85,7 +85,7 @@ before(function () {
   // callback which receives the file descriptor) so that when
   // it is evuantually called we can increment the number of
   // opened file descriptors
-  fs.open = function wrapped_fs_open () {
+  fs.open = function wrappedFSopen () {
     var args = Array.prototype.slice.call(arguments)
     var last = args.length - 1
     var done = args[last]
@@ -100,7 +100,7 @@ before(function () {
   // file descriptors immediately since closing is asynchronous and
   // we check after each response that any opened file descriptors
   // will eventually be closed, not necessarily that they *are* now
-  fs.close = function wrapped_fs_close (fd, cb) {
+  fs.close = function wrappedFSclose (fd, cb) {
     if (typeof fd === 'number') fds.closed++
     return fsClose.call(fs, fd, cb)
   }
@@ -771,7 +771,7 @@ describe('send(file).pipe(res)', function () {
 
         it('should handle the unlying stream becoming destroyed', function (done) {
           var app = http.createServer(function (req, res) {
-            send(req, req.url, {root: 'test/fixtures' })
+            send(req, req.url, {root: 'test/fixtures'})
             .on('stream', function (stream) {
               stream.on('part', function () {
                 stream.destroy()
