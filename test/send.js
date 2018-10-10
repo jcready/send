@@ -206,18 +206,18 @@ describe('send(file).pipe(res)', function () {
     var tmpPath = path.join(__dirname, 'fixtures', resource)
     var app = http.createServer(function (req, res) {
       send(req, req.url, {root: 'test/fixtures'})
-      .on('file', function (path) {
-        fs.unlinkSync(tmpPath)
-      })
-      .pipe(res)
+        .on('file', function (path) {
+          fs.unlinkSync(tmpPath)
+        })
+        .pipe(res)
     })
 
     fs.writeFile(tmpPath, 'howdy', { flag: 'wx' }, function (err) {
       if (err) return done(err)
       request(app)
-      .get(resource)
-      .expect('Content-Type', /plain/)
-      .expect(200, done)
+        .get(resource)
+        .expect('Content-Type', /plain/)
+        .expect(200, done)
     })
   })
 
@@ -1068,15 +1068,15 @@ describe('send(file, options)', function () {
       fs.open(path.join(fixtures, resource), 'r', function (err, fd) {
         if (err) return done(err)
         request(createServer({fd: fd}))
-        .get(resource)
-        .expect(200, done)
+          .get(resource)
+          .expect(200, done)
       })
     })
 
     it('should still error if the fd cannot be streamed', function (done) {
       request(createServer({fd: 999, autoClose: false}))
-      .get('/anything')
-      .expect(500, done)
+        .get('/anything')
+        .expect(500, done)
     })
 
     it('should close the file descriptor if the response ends before pipe', function (done) {
@@ -1086,40 +1086,40 @@ describe('send(file, options)', function () {
             res.end()
             if (err) return done(err)
             send(req, req.url, {fd: fd})
-            .on('close', done)
-            .pipe(res)
+              .on('close', done)
+              .pipe(res)
           })
         } else {
           res.end()
           send(req, req.url, {root: 'test/fixtures'})
-          .on('close', done)
-          .pipe(res)
+            .on('close', done)
+            .pipe(res)
         }
       })
 
       request(app)
-      .get('/nums')
-      .expect(200, function (err) {
-        if (err) return done(err)
-        request(app)
-        .get('/fd')
+        .get('/nums')
         .expect(200, function (err) {
-          if (err) done(err)
+          if (err) return done(err)
+          request(app)
+            .get('/fd')
+            .expect(200, function (err) {
+              if (err) done(err)
+            })
         })
-      })
     })
 
     it('should close the file descriptor if the response ends immediately after pipe', function (done) {
       var app = http.createServer(function (req, res) {
         send(req, req.url, {root: 'test/fixtures'})
-        .on('close', done)
-        .pipe(res)
+          .on('close', done)
+          .pipe(res)
         res.end()
       })
 
       request(app)
-      .get('/name.txt')
-      .expect(200, noop)
+        .get('/name.txt')
+        .expect(200, noop)
     })
   })
 
@@ -1129,11 +1129,11 @@ describe('send(file, options)', function () {
       fs.open(path.join(fixtures, resource), 'r', function (err, fd) {
         if (err) return done(err)
         request(createServer({fd: fd, autoClose: false}))
-        .get(resource)
-        .expect(200, function (err) {
-          if (err) return done(err)
-          fs.close(fd, done)
-        })
+          .get(resource)
+          .expect(200, function (err) {
+            if (err) return done(err)
+            fs.close(fd, done)
+          })
       })
     })
   })

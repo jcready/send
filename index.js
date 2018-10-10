@@ -423,7 +423,7 @@ SendStream.prototype.headersAlreadySent = function headersAlreadySent () {
 SendStream.prototype.isCachable = function isCachable () {
   var statusCode = this.res.statusCode
   return (statusCode >= 200 && statusCode < 300) ||
-    /* istanbul ignore next */ statusCode === 304
+  /* istanbul ignore next */ statusCode === 304
 }
 
 /**
