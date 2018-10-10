@@ -1,3 +1,23 @@
+unreleased
+==========
+
+  * deps: http-errors@~1.6.3
+    - deps: depd@~1.1.2
+    - deps: setprototypeof@1.1.0
+    - deps: statuses@'>= 1.3.1 < 2'
+  * deps: statuses@~1.5.0
+  * perf: remove redundant `path.normalize` call
+
+0.16.2 / 2018-02-07
+===================
+
+  * Fix incorrect end tag in default error & redirects
+  * deps: depd@~1.1.2
+    - perf: remove argument reassignment
+  * deps: encodeurl@~1.0.2
+    - Fix encoding `%` as last character
+  * deps: statuses@~1.4.0
+
 0.16.1 / 2017-09-29
 ===================
 

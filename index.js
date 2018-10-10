@@ -612,7 +612,6 @@ SendStream.prototype.pipe = function pipe (res) {
 
     // join / normalize from optional root dir
     path = normalize(join(root, path))
-    root = normalize(root + sep)
   } else {
     // ".." is malicious without "root"
     if (UP_PATH_REGEXP.test(path)) {
@@ -1044,7 +1043,7 @@ function createHtmlDocument (title, body) {
     '<body>\n' +
     '<pre>' + body + '</pre>\n' +
     '</body>\n' +
-    '<html>\n'
+    '</html>\n'
 }
 
 /**
